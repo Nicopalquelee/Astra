@@ -39,33 +39,29 @@ function App() {
   const sendToAstra = async (userMessage: string) => {
     try {
       console.log('🎙️ Usuario dijo:', userMessage);
-      // Acumular texto para TTS streaming
-      let accumulatedText = '';
-      let isPlayingStream = false;
+      let fullResponse = '';
+      let isCurrentlySpeaking = false;
 
       const onChunk = (chunk: string) => {
-        accumulatedText += chunk;
-        setAstraResponse(accumulatedText);
-        console.log('🔄 Texto acumulado:', accumulatedText);
-
-        // Acumular hasta tener una oración completa (., !, ?)
-        if ((accumulatedText.includes('.') || accumulatedText.includes('!') || accumulatedText.includes('?')) && !isPlayingStream) {
-          isPlayingStream = true;
-          // Extraer la primer oración completa
-          const match = accumulatedText.match(/^[^.!?]*[.!?]/);
-          if (match) {
-            const sentenceToSpeak = match[0];
-            console.log('🔊 Hablando oración:', sentenceToSpeak);
-            speakResponse(sentenceToSpeak).then(() => {
-              isPlayingStream = false;
-            });
-          }
-        }
+        fullResponse += chunk;
+        setAstraResponse(fullResponse);
+        console.log('🔄 Texto acumulado:', fullResponse);
       };
 
+      // Esperar la respuesta completa
       const response = await processAstraRequest(userMessage, onChunk);
+      fullResponse = response;
       setAstraResponse(response);
       console.log('✅ Respuesta final recibida:', response);
+      
+      // Hablar la respuesta completa de una sola vez
+      if (response && !isCurrentlySpeaking) {
+        isCurrentlySpeaking = true;
+        await speakResponse(response);
+        isCurrentlySpeaking = false;
+      }
+      
+      setVoiceState('inactive');
     } catch (error) {
       console.error('❌ Error al comunicarse con Astra:', error);
       const fallbackResponse = 'Lo siento, no pude procesar tu solicitud en este momento.';
@@ -254,54 +250,78 @@ Tú: "Hoy hubo bajo consumo eléctrico y no se detectaron alertas. Todo en orden
     }
   };
 
-  const speakResponse = async (text: string) => {
+  const speakResponse = async (text: string): Promise<void> => {
     const API_KEY = import.meta.env.VITE_OPENAI_API_KEY as string | undefined;
 
-    if (API_KEY) {
-      try {
-        console.log('🎤 Astra respuesta:', text.substring(0, 100) + '...');
-        
-        const response = await fetch('https://api.openai.com/v1/audio/speech', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: 'gpt-4o-mini-tts',
-            input: text,
-            voice: 'cedar',
-            language: 'es',
-            instructions: 'Habla como una asistente inteligente profesional, amable y cercana. Mantén un tono cálido y natural. Responde con confianza y claridad.',
-          }),
-        });
-
-        if (!response.ok) {
-          const errData = await response.text();
-          console.error('❌ Error OpenAI TTS:', response.status, errData);
-          throw new Error('Error en OpenAI TTS: ' + response.status);
-        }
-
-        const audioBlob = await response.blob();
-        const audioUrl = URL.createObjectURL(audioBlob);
-        
-        const audio = new Audio(audioUrl);
-        audio.onended = () => {
-          setVoiceState('inactive');
-          URL.revokeObjectURL(audioUrl);
-        };
-        audio.onerror = () => {
-          console.error('Error reproduciendo audio OpenAI');
-          setVoiceState('inactive');
-          URL.revokeObjectURL(audioUrl);
-        };
-        audio.play();
-        return;
-      } catch (error) {
-        console.warn('OpenAI TTS falló:', error);
-        setVoiceState('inactive');
-      }
+    if (!API_KEY) {
+      console.log('Sin API key, no hay TTS');
+      return Promise.resolve();
     }
+
+    if (!text || !text.trim()) {
+      return Promise.resolve();
+    }
+
+    return new Promise((resolve) => {
+      (async () => {
+        try {
+          console.log('🎤 Astra habla:', text.substring(0, 100) + '...');
+          setVoiceState('responding');
+          
+          const response = await fetch('https://api.openai.com/v1/audio/speech', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${API_KEY}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model: 'gpt-4o-mini-tts',
+              input: text,
+              voice: 'cedar',
+              language: 'es',
+              instructions: 'Habla como una asistente inteligente profesional, amable y cercana. Mantén un tono cálido y natural. Responde con confianza y claridad.',
+            }),
+          });
+
+          if (!response.ok) {
+            const errData = await response.text();
+            console.error('❌ Error OpenAI TTS:', response.status, errData);
+            setVoiceState('inactive');
+            resolve();
+            return;
+          }
+
+          const audioBlob = await response.blob();
+          const audioUrl = URL.createObjectURL(audioBlob);
+          const audio = new Audio(audioUrl);
+
+          audio.onended = () => {
+            console.log('✅ Audio finalizado');
+            setVoiceState('inactive');
+            URL.revokeObjectURL(audioUrl);
+            resolve();
+          };
+
+          audio.onerror = (error) => {
+            console.error('❌ Error reproduciendo audio:', error);
+            setVoiceState('inactive');
+            URL.revokeObjectURL(audioUrl);
+            resolve();
+          };
+
+          audio.play().catch(err => {
+            console.error('Error al reproducir:', err);
+            setVoiceState('inactive');
+            URL.revokeObjectURL(audioUrl);
+            resolve();
+          });
+        } catch (error) {
+          console.warn('❌ OpenAI TTS falló:', error);
+          setVoiceState('inactive');
+          resolve();
+        }
+      })();
+    });
   };
 
 
