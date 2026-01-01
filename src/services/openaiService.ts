@@ -15,12 +15,18 @@ function normalizeForSpanishTTS(text: string): string {
   // 1. Eliminar puntos suspensivos (...)
   let result = text.replace(/\.\.\./g, '');
 
-  // 2. Reemplaza temperaturas: "25°C", "25.5°C", "25,5°C" -> "25 grados" (redondeado)
+  // 2. Reemplaza temperaturas: "25°C", "25.5°C", "25,5°C" -> "25 punto 5 grados" (con decimales)
   result = result.replace(/(\d+(?:[.,]\d+)?)\s?°?\s?C\b/gi, (_m, n) => {
     const raw = String(n);
     const normalized = raw.replace(',', '.');
-    const rounded = Math.round(parseFloat(normalized));
-    return `${rounded} grados`;
+    const parts = normalized.split('.');
+    if (parts.length === 2) {
+      // Tiene decimales: "22.5" -> "22 punto 5"
+      return `${parts[0]} punto ${parts[1]} grados`;
+    } else {
+      // Sin decimales: "22" -> "22 grados"
+      return `${parts[0]} grados`;
+    }
   });
 
   // 3. Reemplaza humedad: "55.5%" -> "55 coma 5 porciento"
