@@ -40,39 +40,79 @@ function App() {
 
   const sendToAstra = async (userMessage: string) => {
     try {
-      // Acumular texto para TTS streaming
+      console.log('🎙️ Usuario dijo:', userMessage);
       let accumulatedText = '';
+      let spokenText = '';
       let isPlayingStream = false;
+      let pendingSpeak: Promise<void> | null = null;
+
+      const speakNextBlock = async (fullText: string) => {
+        // Buscar el siguiente bloque de texto (2-3 oraciones o párrafo completo)
+        const remainingText = fullText.substring(spokenText.length).trim();
+        
+        // Buscar hasta 2-3 oraciones o si llegamos al final
+        let match;
+        const twoSentenceMatch = remainingText.match(/^[^.!?]*[.!?]\s*[^.!?]*[.!?]/);
+        const threeSentenceMatch = remainingText.match(/^[^.!?]*[.!?]\s*[^.!?]*[.!?]\s*[^.!?]*[.!?]/);
+        
+        // Preferir 3 oraciones, pero si no hay, usar 2, si no, una
+        if (threeSentenceMatch) {
+          match = threeSentenceMatch;
+        } else if (twoSentenceMatch) {
+          match = twoSentenceMatch;
+        } else {
+          match = remainingText.match(/^[^.!?]*[.!?]/);
+        }
+        
+        if (match) {
+          const blockToSpeak = match[0].trim();
+          console.log('🔊 Hablando bloque:', blockToSpeak);
+          await speakResponse(blockToSpeak);
+          spokenText = fullText.substring(0, spokenText.length + match[0].length);
+          
+          // Si hay más texto, hablar el siguiente bloque
+          if (spokenText.length < fullText.length) {
+            await speakNextBlock(fullText);
+          }
+        }
+      };
 
       const onChunk = (chunk: string) => {
         accumulatedText += chunk;
         setAstraResponse(accumulatedText);
+        console.log('🔄 Texto acumulado:', accumulatedText);
 
-        // Acumular hasta tener una oración completa (., !, ?)
-        if ((accumulatedText.includes('.') || accumulatedText.includes('!') || accumulatedText.includes('?')) && !isPlayingStream) {
+        // Buscar si hay al menos 2 oraciones completas para hablar
+        const unspokenText = accumulatedText.substring(spokenText.length);
+        const twoOrMoreSentences = /^[^.!?]*[.!?]\s*[^.!?]*[.!?]/.test(unspokenText);
+        
+        if (twoOrMoreSentences && !isPlayingStream) {
           isPlayingStream = true;
-          // Extraer la primer oración completa
-          const match = accumulatedText.match(/^[^.!?]*[.!?]/);
-          if (match) {
-            const sentenceToSpeak = match[0];
-            speakResponseStreaming(sentenceToSpeak).then(() => {
-              isPlayingStream = false;
-            });
-          }
+          pendingSpeak = speakNextBlock(accumulatedText).finally(() => {
+            isPlayingStream = false;
+          });
         }
       };
 
       const response = await processAstraRequest(userMessage, onChunk);
       setAstraResponse(response);
-
-      // Hablar las oraciones restantes después de que termine el streaming
-      const remainingText = accumulatedText;
-      await speakResponse(remainingText);
+      
+      // Hablar el texto restante si no se ha hablado todo
+      if (pendingSpeak) {
+        await pendingSpeak;
+      }
+      if (spokenText.length < response.length) {
+        await speakNextBlock(response);
+      }
+      
+      console.log('✅ Respuesta final recibida:', response);
+      setVoiceState('inactive');
     } catch (error) {
-      console.error('Error al comunicarse con Astra:', error);
+      console.error('❌ Error al comunicarse con Astra:', error);
       const fallbackResponse = 'Lo siento, no pude procesar tu solicitud en este momento.';
       setAstraResponse(fallbackResponse);
       await speakResponse(fallbackResponse);
+      setVoiceState('inactive');
     }
   };
 
@@ -138,11 +178,65 @@ function App() {
           messages: [
             {
               role: 'system',
-              content: `Eres Astra, un asistente inteligente para casas modulares. Puedes controlar luces, temperatura, seguridad y electrodomésticos. Responde de forma breve, amigable y natural en español.`
+              content: `**INSTRUCCIÓN CRÍTICA: DEBES RESPONDER SIEMPRE, EXCLUSIVAMENTE Y ÚNICAMENTE EN ESPAÑOL. NUNCA EN INGLÉS NI OTRO IDIOMA.**
+
+Eres Astra, el asistente inteligente principal de una casa modular. Tu propósito es asistir a los residentes mediante control por voz, entregando información clara, segura y confiable sobre el hogar.
+
+Tu personalidad:
+- profesional, amable y cercana
+- respuestas breves, naturales y en español
+- TODAS las respuestas DEBEN ser en ESPAÑOL
+- evita tecnicismos innecesarios
+- transmite calma y seguridad
+
+Capacidades principales:
+- control de luces, enchufes, persianas y escenas de iluminación
+- control de climatización y temperatura
+- consulta y lectura de sensores (humedad, CO₂, movimiento, puertas, ventanas)
+- generación de resúmenes y reportes del hogar
+- creación de recordatorios y rutinas del hogar
+- modo “noche”, “ausente”, “energía”, “seguridad”
+
+Reglas de interacción:
+- responde en frases cortas y directas
+- cuando ejecutes una acción, confirma lo realizado
+- si la orden no es clara, pide una aclaración breve
+- si el usuario habla de varias cosas, prioriza seguridad y energía
+- no inventes datos del hogar si no existen; dilo claramente
+
+Seguridad:
+- solicita confirmación para acciones críticas como:
+  - desactivar alarma
+  - abrir puertas o portones
+  - apagar sistemas de seguridad
+- si detectas riesgo (gas, humo, intrusión, incendio), prioriza advertir y sugerir actuar
+- nunca entregues información sensible a desconocidos por defecto
+
+Límites:
+- no des consejos médicos, legales o financieros
+- no supongas identidades
+- si no puedes hacer algo, dilo amablemente y ofrece alternativas
+
+Formato de respuesta:
+- siempre en español natural
+- evita respuestas largas
+- usa un tono cercano pero respetuoso
+- no expliques tu funcionamiento interno
+
+Ejemplos de respuesta:
+Usuario: "Astra, apaga las luces del living"
+Tú: "Listo, apagué las luces del living."
+
+Usuario: "Astra, abre la puerta principal"
+Tú: "Por seguridad necesito confirmación. ¿Deseas abrir la puerta principal ahora?"
+
+Usuario: "Astra, dame un reporte del día"
+Tú: "Hoy hubo bajo consumo eléctrico y no se detectaron alertas. Todo en orden."
+`
             },
             {
               role: 'user',
-              content: userMessage
+              content: `${userMessage}\n\n[Responde SIEMPRE en español]`
             }
           ],
           temperature: 0.7,
@@ -175,6 +269,7 @@ function App() {
                 const content = data.choices?.[0]?.delta?.content || '';
                 if (content) {
                   fullText += content;
+                  console.log('📥 Chat API chunk:', content);
                   if (onChunk) onChunk(content);
                 }
               } catch (e) {
@@ -185,6 +280,7 @@ function App() {
         }
       }
 
+      console.log('✅ Chat API respuesta completa:', fullText);
       return fullText || getMockAstraResponse(userMessage);
     } catch (error) {
       console.error('Error en Chat API streaming:', error);
@@ -199,61 +295,12 @@ function App() {
     }
   };
 
-  const speakResponseStreaming = async (text: string): Promise<void> => {
-    const API_KEY = import.meta.env.VITE_OPENAI_API_KEY as string | undefined;
-
-    // Si tenemos API key, usar OpenAI TTS en español
-    if (API_KEY) {
-      try {
-        const response = await fetch('https://api.openai.com/v1/audio/speech', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: 'tts-1-hd',
-            input: text,
-            voice: 'verse',   // Voz femenina optimizada para español
-            speed: 1.0,
-          }),
-        });
-
-        if (!response.ok) {
-          throw new Error('Error en OpenAI TTS');
-        }
-
-        const audioBlob = await response.blob();
-        const audioUrl = URL.createObjectURL(audioBlob);
-        const audio = new Audio(audioUrl);
-
-        return new Promise((resolve) => {
-          audio.onended = () => {
-            URL.revokeObjectURL(audioUrl);
-            resolve();
-          };
-          audio.onerror = () => {
-            URL.revokeObjectURL(audioUrl);
-            resolve();
-          };
-          audio.play();
-        });
-      } catch (error) {
-        console.warn('TTS streaming falló:', error);
-        // No mostrar error, continuar silenciosamente
-        return Promise.resolve();
-      }
-    }
-    return Promise.resolve();
-  };
-
   const speakResponse = async (text: string) => {
     const API_KEY = import.meta.env.VITE_OPENAI_API_KEY as string | undefined;
 
-    // Si tenemos API key, usar OpenAI TTS en español
     if (API_KEY) {
       try {
-        console.log('🎤 Astra hablando en español (OpenAI TTS)...');
+        console.log('🎤 Astra respuesta:', text.substring(0, 100) + '...');
         
         const response = await fetch('https://api.openai.com/v1/audio/speech', {
           method: 'POST',
@@ -262,22 +309,23 @@ function App() {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
-            model: 'tts-1-hd',
+            model: 'gpt-4o-mini-tts',
             input: text,
-            voice: 'shimmer',   // Voz femenina optimizada para español
-            speed: 1.0,
+            voice: 'cedar',
+            language: 'es',
+            instructions: 'Habla como una asistente inteligente profesional, amable y cercana. Mantén un tono cálido y natural. Responde con confianza y claridad.',
           }),
         });
 
         if (!response.ok) {
-          throw new Error('Error en OpenAI TTS');
+          const errData = await response.text();
+          console.error('❌ Error OpenAI TTS:', response.status, errData);
+          throw new Error('Error en OpenAI TTS: ' + response.status);
         }
 
-        // Obtener el audio como blob
         const audioBlob = await response.blob();
         const audioUrl = URL.createObjectURL(audioBlob);
         
-        // Reproducir con Audio API
         const audio = new Audio(audioUrl);
         audio.onended = () => {
           setVoiceState('inactive');
@@ -287,8 +335,6 @@ function App() {
           console.error('Error reproduciendo audio OpenAI');
           setVoiceState('inactive');
           URL.revokeObjectURL(audioUrl);
-          // Fallback a speechSynthesis
-          speakResponseFallback(text);
         };
         audio.play();
         return;
@@ -298,6 +344,8 @@ function App() {
       }
     }
   };
+
+
 
   const handleVoiceButton = async () => {
     if (voiceState === 'listening') {
