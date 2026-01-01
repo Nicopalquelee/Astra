@@ -1,7 +1,48 @@
 import { useState, useEffect, useRef } from 'react';
-import { Mic, MicOff, Volume2, Volume1, VolumeX } from 'lucide-react';
+import { Mic, MicOff, Volume2, Volume1 } from 'lucide-react';
 
 type VoiceState = 'inactive' | 'listening' | 'responding';
+
+/**
+ * Normaliza textos para TTS en español.
+ * - Elimina puntos suspensivos (...)
+ * - Convierte decimales en métricas a palabras (ej: "25.5°C" -> "25 grados")
+ * - Reemplaza comas/puntos en números con palabras "coma" (ej: "55.5%" -> "55 coma 5 porciento")
+ */
+function normalizeForSpanishTTS(text: string): string {
+  if (!text) return text;
+
+  // 1. Eliminar puntos suspensivos (...)
+  let result = text.replace(/\.\.\./g, '');
+
+  // 2. Reemplaza temperaturas: "25°C", "25.5°C", "25,5°C" -> "25 grados" (redondeado)
+  result = result.replace(/(\d+(?:[.,]\d+)?)\s?°?\s?C\b/gi, (_m, n) => {
+    const raw = String(n);
+    const normalized = raw.replace(',', '.');
+    const rounded = Math.round(parseFloat(normalized));
+    return `${rounded} grados`;
+  });
+
+  // 3. Reemplaza humedad: "55.5%" -> "55 coma 5 porciento"
+  result = result.replace(/(\d+)([.,])(\d+)\s?%/g, '$1 coma $3 porciento');
+  result = result.replace(/(\d+)\s?%/g, '$1 porciento');
+
+  // 4. Reemplaza CO2: "410.5 ppm" -> "410 coma 5 ppm"
+  result = result.replace(/(\d+)([.,])(\d+)\s?ppm/gi, '$1 coma $3 ppm');
+
+  // 5. Reemplaza luz en lux: "650.5 lux" -> "650 lux" (sin decimales para luz)
+  result = result.replace(/(\d+)([.,]\d+)?\s?lux/gi, (_m, n) => {
+    const raw = String(n);
+    const normalized = raw.replace(',', '.');
+    const rounded = Math.round(parseFloat(normalized));
+    return `${rounded} lux`;
+  });
+
+  // 6. Reemplaza otros decimales genéricos: "12.4 kWh" -> "12 coma 4 kWh"
+  result = result.replace(/(\d+)([.,])(\d+)\s?(kWh|kW|L\/h|ppm|lux)/gi, '$1 coma $3 $4');
+
+  return result;
+}
 
 function App() {
   const [voiceState, setVoiceState] = useState<VoiceState>('inactive');
@@ -9,7 +50,8 @@ function App() {
   const [astraResponse, setAstraResponse] = useState('');
   const [recognition, setRecognition] = useState<SpeechRecognition | null>(null);
   const [volume, setVolume] = useState(0.8);
-  const [muted, setMuted] = useState(false);
+  
+  // Replaced mute toggle: control volume only
 
   // Refs para controlar reproducción e interrupciones
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -17,9 +59,11 @@ function App() {
   const isSpeakingRef = useRef(false);
   const lastTranscriptRef = useRef<string>('');
   const spokenIndexRef = useRef(0);
+  const queueRef = useRef<string[]>([]);
+  const bufferRef = useRef<string>('');
 
   const [sensorData, setSensorData] = useState({
-    temperature: 22.5,
+    temperature: 22,
     humidity: 55,
     co2: 410,
     lightLevel: 650,
@@ -114,27 +158,63 @@ function App() {
     try {
       console.log('🎙️ Usuario dijo:', userMessage);
       let fullResponse = '';
-      let isCurrentlySpeaking = false;
 
+      // onChunk will buffer incoming text and flush sentences/blocks to the TTS queue
       const onChunk = (chunk: string) => {
         fullResponse += chunk;
         setAstraResponse(fullResponse);
-        console.log('🔄 Texto acumulado:', fullResponse);
+        // accumulate in buffer for chunked TTS
+        bufferRef.current += chunk;
+
+        // flush complete sentences or long fragments into the speak queue
+        let flushed = true;
+        while (flushed) {
+          flushed = false;
+          const buf = bufferRef.current;
+          if (!buf) break;
+          const sentenceRegex = /([\s\S]*?[\.\?!])(?:\s|$)/;
+          const m = buf.match(sentenceRegex);
+          if (m && m[1]) {
+            const sentence = m[1].trim();
+            queueRef.current.push(sentence);
+            bufferRef.current = buf.slice(m[1].length);
+            flushed = true;
+          } else if (buf.length > 220) {
+            // flush a chunk if it's getting too long
+            const part = buf.slice(0, 220);
+            queueRef.current.push(part);
+            bufferRef.current = buf.slice(220);
+            flushed = true;
+          }
+        }
+
+        // Start playback queue if idle
+        processQueue();
       };
 
-      // Respuesta mejorada con datos de sensores
+      // Respuesta mejorada con datos de sensores (streaming)
       const response = await processAstraRequest(userMessage, onChunk, sensorData);
+      // push any remaining buffered text
+      if (bufferRef.current && bufferRef.current.trim()) {
+        queueRef.current.push(bufferRef.current.trim());
+        bufferRef.current = '';
+      }
+
+      // ensure final text is set
       fullResponse = response;
       setAstraResponse(response);
       console.log('✅ Respuesta final recibida:', response);
-      
-      // Hablar la respuesta completa de una sola vez
-      if (response && !isCurrentlySpeaking) {
-        isCurrentlySpeaking = true;
-        await speakResponse(response);
-        isCurrentlySpeaking = false;
-      }
-      
+
+      // Wait until queue is drained
+      await new Promise<void>(resolve => {
+        const interval = setInterval(() => {
+          if (!isSpeakingRef.current && queueRef.current.length === 0) {
+            clearInterval(interval);
+            resolve();
+          }
+        }, 150);
+      });
+
       setVoiceState('inactive');
     } catch (error) {
       console.error('❌ Error al comunicarse con Astra:', error);
@@ -142,6 +222,57 @@ function App() {
       setAstraResponse(fallbackResponse);
       await speakResponse(fallbackResponse);
       setVoiceState('inactive');
+    }
+  };
+
+  // Start/stop listening helpers for hold-to-talk
+  const startListening = async () => {
+    // interrupt any playback and clear queue to prioritize user
+    if (audioRef.current) {
+      try { audioRef.current.pause(); audioRef.current.currentTime = 0; } catch (e) {}
+      try { URL.revokeObjectURL(audioUrlRef.current || ''); } catch (e) {}
+      audioRef.current = null;
+      audioUrlRef.current = null;
+    }
+    queueRef.current = [];
+    bufferRef.current = '';
+    isSpeakingRef.current = false;
+
+    try {
+      await navigator.mediaDevices.getUserMedia({ audio: true });
+      setUserTranscript('');
+      setAstraResponse('');
+      setVoiceState('listening');
+      playSound('listen');
+      recognition?.start();
+    } catch (error) {
+      console.error('Error al acceder al micrófono:', error);
+      alert('No se pudo acceder al micrófono. Por favor, concede los permisos necesarios.');
+    }
+  };
+
+  const stopListening = () => {
+    try {
+      recognition?.stop();
+    } catch (e) {
+      console.warn('stopListening error', e);
+    }
+  };
+
+  // Flush/queue processing helpers
+  const processQueue = async () => {
+    if (isSpeakingRef.current) return;
+    const next = queueRef.current.shift();
+    if (!next) return;
+    try {
+      isSpeakingRef.current = true;
+      await speakResponse(next);
+    } catch (e) {
+      console.warn('Error procesando queue chunk', e);
+    } finally {
+      isSpeakingRef.current = false;
+      // process next chunk if present
+      if (queueRef.current.length > 0) setTimeout(() => processQueue(), 0);
     }
   };
 
@@ -344,7 +475,9 @@ Formato de respuesta:
     return new Promise((resolve) => {
       (async () => {
         try {
-          console.log('🎤 Astra habla:', text.substring(0, 100) + '...');
+          // Normalizar texto antes de TTS
+          const normalizedText = normalizeForSpanishTTS(text);
+          console.log('🎤 Astra habla:', normalizedText.substring(0, 100) + '...');
           
           const response = await fetch('https://api.openai.com/v1/audio/speech', {
             method: 'POST',
@@ -354,8 +487,8 @@ Formato de respuesta:
             },
             body: JSON.stringify({
               model: 'gpt-4o-mini-tts',
-              input: text,
-              voice: 'cedar',
+              input: normalizedText,
+              voice: 'nova',
               language: 'es',
               instructions: 'Habla como una asistente inteligente profesional, amable y cercana. Mantén un tono cálido y natural. Responde con confianza y claridad.',
             }),
@@ -381,8 +514,8 @@ Formato de respuesta:
             console.log('No se pudo forzar altavoz, usando dispositivo por defecto:', e);
           });
 
-          // Aplicar volumen y mute
-          audio.volume = muted ? 0 : volume;
+          // Aplicar volumen
+          audio.volume = volume;
 
           audio.onended = () => {
             console.log('✅ Audio finalizado');
@@ -554,6 +687,27 @@ Formato de respuesta:
           border: none;
           box-shadow: 0 0 10px rgba(59, 130, 246, 0.5);
         }
+        /* Shimmer skeleton */
+        .shimmer {
+          position: relative;
+          overflow: hidden;
+          background: rgba(255,255,255,0.02);
+        }
+        .shimmer::after {
+          content: '';
+          position: absolute;
+          top: 0;
+          left: -150%;
+          height: 100%;
+          width: 250%;
+          background: linear-gradient(90deg, rgba(255,255,255,0) 0%, rgba(255,255,255,0.06) 50%, rgba(255,255,255,0) 100%);
+          animation: shimmer 1.6s linear infinite;
+        }
+        @keyframes shimmer {
+          0% { transform: translateX(0%); }
+          100% { transform: translateX(40%); }
+        }
+        .shimmer-line { height: 14px; border-radius: 6px; background: rgba(255,255,255,0.03); margin-bottom: 10px; }
       `}</style>
 
       <div className="relative container mx-auto px-4 py-8 max-w-4xl">
@@ -607,30 +761,27 @@ Formato de respuesta:
         </div>
 
         <div className="flex flex-col items-center justify-center mb-12 gap-4">
-          <div className="flex items-center gap-4">
-            <button
-              onClick={handleVoiceButton}
-              disabled={voiceState === 'responding'}
-              className={getButtonStyle()}
-            >
-              <div className="text-center">
-                {voiceState === 'listening' ? (
-                  <Mic className="w-20 h-20 mx-auto mb-3" />
-                ) : (
-                  <MicOff className="w-20 h-20 mx-auto mb-3 opacity-80" />
-                )}
-                <span className="text-base">{getButtonText()}</span>
-              </div>
-            </button>
-
-            <button
-              onClick={() => setMuted(m => !m)}
-              className="w-12 h-12 rounded-full flex items-center justify-center bg-blue-700 hover:bg-blue-600 transition-colors shadow-md"
-              title={muted ? 'Activar sonido' : 'Silenciar'}
-            >
-              {muted ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
-            </button>
-          </div>
+            <div className="flex items-center gap-4">
+              <button
+                // Hold-to-talk: start on pointer down / touchstart, stop on release
+                onMouseDown={() => startListening()}
+                onTouchStart={(e) => { e.preventDefault(); startListening(); }}
+                onMouseUp={() => stopListening()}
+                onTouchEnd={() => stopListening()}
+                onMouseLeave={() => { if (voiceState === 'listening') stopListening(); }}
+                disabled={voiceState === 'responding'}
+                className={getButtonStyle()}
+              >
+                <div className="text-center">
+                  {voiceState === 'listening' ? (
+                    <Mic className="w-20 h-20 mx-auto mb-3" />
+                  ) : (
+                    <MicOff className="w-20 h-20 mx-auto mb-3 opacity-80" />
+                  )}
+                  <span className="text-base">{getButtonText()}</span>
+                </div>
+              </button>
+            </div>
         </div>
 
         <div className="text-center mb-8">
@@ -653,13 +804,27 @@ Formato de respuesta:
               </div>
             )}
 
-            {astraResponse && (
+            {astraResponse ? (
               <div className="bg-gradient-to-r from-purple-900/40 to-transparent rounded-xl p-4 border border-purple-600/30">
                 <p className="text-xs text-purple-200 mb-2 font-semibold uppercase tracking-wide">
                   Astra responde:
                 </p>
                 <p className="text-blue-50 text-lg leading-relaxed">{astraResponse}</p>
               </div>
+            ) : (
+              // show shimmer skeleton while responding
+              voiceState === 'responding' && (
+                <div className="bg-gradient-to-r from-purple-900/20 to-transparent rounded-xl p-4 border border-purple-600/20">
+                  <p className="text-xs text-purple-200 mb-2 font-semibold uppercase tracking-wide">
+                    Astra responde:
+                  </p>
+                  <div className="shimmer p-3 rounded">
+                    <div className="shimmer-line w-5/6"></div>
+                    <div className="shimmer-line w-4/6"></div>
+                    <div className="shimmer-line w-3/6"></div>
+                  </div>
+                </div>
+              )
             )}
           </div>
         )}

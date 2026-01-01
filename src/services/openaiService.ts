@@ -3,6 +3,47 @@
 
 import { SensorData } from '../hooks/useSensorData';
 
+/**
+ * Normaliza textos para TTS en español.
+ * - Elimina puntos suspensivos (...)
+ * - Convierte decimales en métricas a palabras (ej: "25.5°C" -> "25 grados")
+ * - Reemplaza comas/puntos en números con palabras "coma" (ej: "55.5%" -> "55 coma 5 porciento")
+ */
+function normalizeForSpanishTTS(text: string): string {
+  if (!text) return text;
+
+  // 1. Eliminar puntos suspensivos (...)
+  let result = text.replace(/\.\.\./g, '');
+
+  // 2. Reemplaza temperaturas: "25°C", "25.5°C", "25,5°C" -> "25 grados" (redondeado)
+  result = result.replace(/(\d+(?:[.,]\d+)?)\s?°?\s?C\b/gi, (_m, n) => {
+    const raw = String(n);
+    const normalized = raw.replace(',', '.');
+    const rounded = Math.round(parseFloat(normalized));
+    return `${rounded} grados`;
+  });
+
+  // 3. Reemplaza humedad: "55.5%" -> "55 coma 5 porciento"
+  result = result.replace(/(\d+)([.,])(\d+)\s?%/g, '$1 coma $3 porciento');
+  result = result.replace(/(\d+)\s?%/g, '$1 porciento');
+
+  // 4. Reemplaza CO2: "410.5 ppm" -> "410 coma 5 ppm"
+  result = result.replace(/(\d+)([.,])(\d+)\s?ppm/gi, '$1 coma $3 ppm');
+
+  // 5. Reemplaza luz en lux: "650.5 lux" -> "650 lux" (sin decimales para luz)
+  result = result.replace(/(\d+)([.,]\d+)?\s?lux/gi, (_m, n) => {
+    const raw = String(n);
+    const normalized = raw.replace(',', '.');
+    const rounded = Math.round(parseFloat(normalized));
+    return `${rounded} lux`;
+  });
+
+  // 6. Reemplaza otros decimales genéricos: "12.4 kWh" -> "12 coma 4 kWh"
+  result = result.replace(/(\d+)([.,])(\d+)\s?(kWh|kW|L\/h|ppm|lux)/gi, '$1 coma $3 $4');
+
+  return result;
+}
+
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
@@ -225,6 +266,9 @@ Formato de respuesta:
     }
 
     try {
+      // Normalizar texto para TTS (p. ej. "25°C" -> "25 grados Celsius")
+      const inputForTTS = normalizeForSpanishTTS(text);
+
       const response = await fetch(`${this.baseURL}/audio/speech`, {
         method: 'POST',
         headers: {
@@ -233,8 +277,9 @@ Formato de respuesta:
         },
         body: JSON.stringify({
           model: 'gpt-4o-mini-tts',
-          input: text,
-          voice: options?.voice || 'cedar',
+          input: inputForTTS,
+          // Voz por defecto femenina: 'nova'
+          voice: options?.voice || 'nova',
           speed: options?.speed || 1.0,
           language: options?.language || 'es',
           instructions:
