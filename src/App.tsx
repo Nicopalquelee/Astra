@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
-import { Mic, MicOff } from 'lucide-react';
+import { Mic, MicOff, Send } from 'lucide-react';
 
-type VoiceState = 'inactive' | 'listening' | 'responding';
+type VoiceState = 'inactive' | 'listening' | 'responding' | 'waiting-send';
 
 function App() {
   const [voiceState, setVoiceState] = useState<VoiceState>('inactive');
@@ -20,9 +20,7 @@ function App() {
       recognitionInstance.onresult = (event: any) => {
         const transcript = event.results[0][0].transcript;
         setUserTranscript(transcript);
-        setVoiceState('responding');
-
-        sendToAstra(transcript);
+        setVoiceState('waiting-send');
       };
 
       recognitionInstance.onerror = (event: any) => {
@@ -41,72 +39,33 @@ function App() {
   const sendToAstra = async (userMessage: string) => {
     try {
       console.log('🎙️ Usuario dijo:', userMessage);
+      // Acumular texto para TTS streaming
       let accumulatedText = '';
-      let spokenText = '';
       let isPlayingStream = false;
-      let pendingSpeak: Promise<void> | null = null;
-
-      const speakNextBlock = async (fullText: string) => {
-        // Buscar el siguiente bloque de texto (2-3 oraciones o párrafo completo)
-        const remainingText = fullText.substring(spokenText.length).trim();
-        
-        // Buscar hasta 2-3 oraciones o si llegamos al final
-        let match;
-        const twoSentenceMatch = remainingText.match(/^[^.!?]*[.!?]\s*[^.!?]*[.!?]/);
-        const threeSentenceMatch = remainingText.match(/^[^.!?]*[.!?]\s*[^.!?]*[.!?]\s*[^.!?]*[.!?]/);
-        
-        // Preferir 3 oraciones, pero si no hay, usar 2, si no, una
-        if (threeSentenceMatch) {
-          match = threeSentenceMatch;
-        } else if (twoSentenceMatch) {
-          match = twoSentenceMatch;
-        } else {
-          match = remainingText.match(/^[^.!?]*[.!?]/);
-        }
-        
-        if (match) {
-          const blockToSpeak = match[0].trim();
-          console.log('🔊 Hablando bloque:', blockToSpeak);
-          await speakResponse(blockToSpeak);
-          spokenText = fullText.substring(0, spokenText.length + match[0].length);
-          
-          // Si hay más texto, hablar el siguiente bloque
-          if (spokenText.length < fullText.length) {
-            await speakNextBlock(fullText);
-          }
-        }
-      };
 
       const onChunk = (chunk: string) => {
         accumulatedText += chunk;
         setAstraResponse(accumulatedText);
         console.log('🔄 Texto acumulado:', accumulatedText);
 
-        // Buscar si hay al menos 2 oraciones completas para hablar
-        const unspokenText = accumulatedText.substring(spokenText.length);
-        const twoOrMoreSentences = /^[^.!?]*[.!?]\s*[^.!?]*[.!?]/.test(unspokenText);
-        
-        if (twoOrMoreSentences && !isPlayingStream) {
+        // Acumular hasta tener una oración completa (., !, ?)
+        if ((accumulatedText.includes('.') || accumulatedText.includes('!') || accumulatedText.includes('?')) && !isPlayingStream) {
           isPlayingStream = true;
-          pendingSpeak = speakNextBlock(accumulatedText).finally(() => {
-            isPlayingStream = false;
-          });
+          // Extraer la primer oración completa
+          const match = accumulatedText.match(/^[^.!?]*[.!?]/);
+          if (match) {
+            const sentenceToSpeak = match[0];
+            console.log('🔊 Hablando oración:', sentenceToSpeak);
+            speakResponse(sentenceToSpeak).then(() => {
+              isPlayingStream = false;
+            });
+          }
         }
       };
 
       const response = await processAstraRequest(userMessage, onChunk);
       setAstraResponse(response);
-      
-      // Hablar el texto restante si no se ha hablado todo
-      if (pendingSpeak) {
-        await pendingSpeak;
-      }
-      if (spokenText.length < response.length) {
-        await speakNextBlock(response);
-      }
-      
       console.log('✅ Respuesta final recibida:', response);
-      setVoiceState('inactive');
     } catch (error) {
       console.error('❌ Error al comunicarse con Astra:', error);
       const fallbackResponse = 'Lo siento, no pude procesar tu solicitud en este momento.';
@@ -371,6 +330,16 @@ Tú: "Hoy hubo bajo consumo eléctrico y no se detectaron alertas. Todo en orden
     }
   };
 
+  const handleSendMessage = async () => {
+    if (userTranscript) {
+      setVoiceState('responding');
+      setAstraResponse('');
+      await sendToAstra(userTranscript);
+      setVoiceState('inactive');
+      setUserTranscript('');
+    }
+  };
+
   const getButtonStyle = () => {
     const baseStyle = "w-48 h-48 rounded-full flex items-center justify-center transition-all duration-300 shadow-2xl";
 
@@ -379,6 +348,8 @@ Tú: "Hoy hubo bajo consumo eléctrico y no se detectaron alertas. Todo en orden
         return `${baseStyle} bg-gradient-to-br from-blue-400 to-blue-600 animate-pulse scale-110`;
       case 'responding':
         return `${baseStyle} bg-gradient-to-br from-blue-500 to-blue-700 opacity-75`;
+      case 'waiting-send':
+        return `${baseStyle} bg-gradient-to-br from-green-400 to-green-600 hover:scale-105 cursor-pointer`;
       default:
         return `${baseStyle} bg-gradient-to-br from-blue-500 to-blue-700 hover:scale-105 cursor-pointer`;
     }
@@ -390,6 +361,8 @@ Tú: "Hoy hubo bajo consumo eléctrico y no se detectaron alertas. Todo en orden
         return 'Escuchando...';
       case 'responding':
         return 'Respondiendo...';
+      case 'waiting-send':
+        return 'Enviar';
       default:
         return 'Hablar con Astra';
     }
@@ -409,21 +382,32 @@ Tú: "Hoy hubo bajo consumo eléctrico y no se detectaron alertas. Todo en orden
           </p>
         </header>
 
-        <div className="flex flex-col items-center justify-center mb-12">
+        <div className="flex flex-col items-center justify-center mb-12 gap-6">
           <button
-            onClick={handleVoiceButton}
+            onClick={voiceState === 'waiting-send' ? handleSendMessage : handleVoiceButton}
             disabled={voiceState === 'responding'}
             className={getButtonStyle()}
           >
             <div className="text-center">
               {voiceState === 'listening' ? (
                 <Mic className="w-16 h-16 mx-auto mb-2" />
+              ) : voiceState === 'waiting-send' ? (
+                <Send className="w-16 h-16 mx-auto mb-2" />
               ) : (
                 <MicOff className="w-16 h-16 mx-auto mb-2 opacity-80" />
               )}
               <span className="text-sm font-medium">{getButtonText()}</span>
             </div>
           </button>
+
+          {voiceState === 'waiting-send' && (
+            <button
+              onClick={handleVoiceButton}
+              className="px-6 py-2 rounded-full bg-blue-600 hover:bg-blue-700 transition-colors text-sm font-medium"
+            >
+              Volver a grabar
+            </button>
+          )}
         </div>
 
         <div className="text-center mb-8">
