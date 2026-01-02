@@ -5,41 +5,49 @@ type VoiceState = 'inactive' | 'listening' | 'responding';
 
 /**
  * Normaliza textos para TTS en español.
- * - Elimina puntos suspensivos (...)
- * - Convierte decimales en métricas a palabras (ej: "25.5°C" -> "25 grados")
- * - Reemplaza comas/puntos en números con palabras "coma" (ej: "55.5%" -> "55 coma 5 porciento")
+ * Restructura métricas para que se lean correctamente con decimales.
+ * - Temperaturas: "22.5°C" -> "22 punto 5 grados"
+ * - Porcentajes: "55.5%" -> "55 punto 5 porciento"
+ * - Otras métricas: "410.5 ppm" -> "410 punto 5 ppm"
  */
 function normalizeForSpanishTTS(text: string): string {
   if (!text) return text;
 
+  let result = text;
+
   // 1. Eliminar puntos suspensivos (...)
-  let result = text.replace(/\.\.\./g, '');
+  result = result.replace(/\.\.\./g, '');
 
-  // 2. Reemplaza temperaturas: "25°C", "25.5°C", "25,5°C" -> "25 grados" (redondeado)
-  result = result.replace(/(\d+(?:[.,]\d+)?)\s?°?\s?C\b/gi, (_m, n) => {
-    const raw = String(n);
-    const normalized = raw.replace(',', '.');
-    const rounded = Math.round(parseFloat(normalized));
-    return `${rounded} grados`;
+  // 2. Temperaturas: "22.5°C", "22,5°C", "22°C" -> "22 punto 5 grados" o "22 grados"
+  result = result.replace(/(\d+)([.,])(\d+)\s?°?\s?C\b/gi, (_m, entero, sep, decimal) => {
+    return `${entero} punto ${decimal} grados`;
+  });
+  result = result.replace(/(\d+)\s?°?\s?C\b/gi, (_m, entero) => {
+    return `${entero} grados`;
   });
 
-  // 3. Reemplaza humedad: "55.5%" -> "55 coma 5 porciento"
-  result = result.replace(/(\d+)([.,])(\d+)\s?%/g, '$1 coma $3 porciento');
-  result = result.replace(/(\d+)\s?%/g, '$1 porciento');
-
-  // 4. Reemplaza CO2: "410.5 ppm" -> "410 coma 5 ppm"
-  result = result.replace(/(\d+)([.,])(\d+)\s?ppm/gi, '$1 coma $3 ppm');
-
-  // 5. Reemplaza luz en lux: "650.5 lux" -> "650 lux" (sin decimales para luz)
-  result = result.replace(/(\d+)([.,]\d+)?\s?lux/gi, (_m, n) => {
-    const raw = String(n);
-    const normalized = raw.replace(',', '.');
-    const rounded = Math.round(parseFloat(normalized));
-    return `${rounded} lux`;
+  // 3. Porcentajes: "55.5%" -> "55 punto 5 porciento", "55%" -> "55 porciento"
+  result = result.replace(/(\d+)([.,])(\d+)\s?%/g, (_m, entero, sep, decimal) => {
+    return `${entero} punto ${decimal} porciento`;
+  });
+  result = result.replace(/(\d+)\s?%/g, (_m, entero) => {
+    return `${entero} porciento`;
   });
 
-  // 6. Reemplaza otros decimales genéricos: "12.4 kWh" -> "12 coma 4 kWh"
-  result = result.replace(/(\d+)([.,])(\d+)\s?(kWh|kW|L\/h|ppm|lux)/gi, '$1 coma $3 $4');
+  // 4. CO2 (ppm): "410.5 ppm" -> "410 punto 5 ppm", "410 ppm" -> "410 ppm"
+  result = result.replace(/(\d+)([.,])(\d+)\s?ppm/gi, (_m, entero, sep, decimal) => {
+    return `${entero} punto ${decimal} ppm`;
+  });
+
+  // 5. Lux (iluminación): "650.5 lux" -> "650 punto 5 lux", "650 lux" -> "650 lux"
+  result = result.replace(/(\d+)([.,])(\d+)\s?lux/gi, (_m, entero, sep, decimal) => {
+    return `${entero} punto ${decimal} lux`;
+  });
+
+  // 6. Otras unidades: kWh, kW, etc. "12.4 kWh" -> "12 punto 4 kWh"
+  result = result.replace(/(\d+)([.,])(\d+)\s?(kWh|kW|L\/h)/gi, (_m, entero, sep, decimal, unidad) => {
+    return `${entero} punto ${decimal} ${unidad}`;
+  });
 
   return result;
 }
@@ -61,6 +69,7 @@ function App() {
   const spokenIndexRef = useRef(0);
   const queueRef = useRef<string[]>([]);
   const bufferRef = useRef<string>('');
+  const isListeningActiveRef = useRef(false);
 
   const [sensorData, setSensorData] = useState({
     temperature: 22,
@@ -122,17 +131,26 @@ function App() {
 
       recognitionInstance.onerror = (event: any) => {
         console.error('Error de reconocimiento de voz:', event.error);
+        // Limpiar transcript al detectar error
+        lastTranscriptRef.current = '';
+        setUserTranscript('');
+        isListeningActiveRef.current = false;
         setVoiceState('inactive');
       };
 
       recognitionInstance.onend = () => {
         // Auto-enviar al terminar de hablar
         const transcript = lastTranscriptRef.current;
-        if (transcript && transcript.trim()) {
+        const wasListening = isListeningActiveRef.current;
+        // Limpiar inmediatamente para evitar reenvíos
+        lastTranscriptRef.current = '';
+        if (transcript && transcript.trim() && wasListening) {
+          isListeningActiveRef.current = false;
           setVoiceState('responding');
           // usar microtask para evitar bloqueo en el handler
           setTimeout(() => sendToAstra(transcript), 0);
         } else {
+          isListeningActiveRef.current = false;
           setVoiceState(s => (s === 'listening' ? 'inactive' : s));
         }
       };
@@ -167,23 +185,75 @@ function App() {
         bufferRef.current += chunk;
 
         // flush complete sentences or long fragments into the speak queue
+        // NO dividir en puntos decimales dentro de números (ej: 22.5, 3.14)
         let flushed = true;
         while (flushed) {
           flushed = false;
           const buf = bufferRef.current;
           if (!buf) break;
-          const sentenceRegex = /([\s\S]*?[\.\?!])(?:\s|$)/;
-          const m = buf.match(sentenceRegex);
-          if (m && m[1]) {
-            const sentence = m[1].trim();
+          
+          // Buscar puntuación final (. ! ?) que NO sea parte de un número decimal
+          let foundSplit = false;
+          let splitIndex = -1;
+          
+          for (let i = 0; i < buf.length; i++) {
+            const char = buf[i];
+            if (char === '.' || char === '!' || char === '?') {
+              // Verificar si el punto es parte de un número decimal
+              if (char === '.' && i > 0 && i < buf.length - 1) {
+                const before = buf[i - 1];
+                const after = buf[i + 1];
+                // Si hay un dígito antes y después, es un decimal, no dividir aquí
+                if (/\d/.test(before) && /\d/.test(after)) {
+                  continue;
+                }
+              }
+              // Verificar que hay un espacio después o es el final
+              if (i === buf.length - 1) {
+                splitIndex = i + 1;
+                foundSplit = true;
+                break;
+              }
+              const nextChar = buf[i + 1];
+              if (nextChar === ' ' || nextChar === '\n') {
+                splitIndex = i + 1;
+                foundSplit = true;
+                break;
+              }
+            }
+          }
+          
+          if (foundSplit && splitIndex > 0) {
+            const sentence = buf.slice(0, splitIndex).trim();
             queueRef.current.push(sentence);
-            bufferRef.current = buf.slice(m[1].length);
+            bufferRef.current = buf.slice(splitIndex).trim();
             flushed = true;
           } else if (buf.length > 220) {
             // flush a chunk if it's getting too long
-            const part = buf.slice(0, 220);
+            // Buscar un punto seguro para dividir (no dentro de números)
+            let splitPoint = 220;
+            for (let i = Math.min(220, buf.length - 1); i > 100; i--) {
+              const char = buf[i];
+              if (char === '.' || char === '!' || char === '?') {
+                // Verificar si el punto es parte de un número decimal
+                const isDecimalPoint = (char === '.' && i > 0 && i < buf.length - 1 && 
+                                       /\d/.test(buf[i-1]) && /\d/.test(buf[i+1]));
+                if (!isDecimalPoint) {
+                  if (i === buf.length - 1) {
+                    splitPoint = i + 1;
+                    break;
+                  }
+                  const nextChar = buf[i + 1];
+                  if (nextChar === ' ' || nextChar === '\n') {
+                    splitPoint = i + 1;
+                    break;
+                  }
+                }
+              }
+            }
+            const part = buf.slice(0, splitPoint).trim();
             queueRef.current.push(part);
-            bufferRef.current = buf.slice(220);
+            bufferRef.current = buf.slice(splitPoint).trim();
             flushed = true;
           }
         }
@@ -237,16 +307,20 @@ function App() {
     queueRef.current = [];
     bufferRef.current = '';
     isSpeakingRef.current = false;
+    // Limpiar transcript anterior para evitar reenvíos
+    lastTranscriptRef.current = '';
+    setUserTranscript('');
 
     try {
       await navigator.mediaDevices.getUserMedia({ audio: true });
-      setUserTranscript('');
       setAstraResponse('');
+      isListeningActiveRef.current = true;
       setVoiceState('listening');
       playSound('listen');
       recognition?.start();
     } catch (error) {
       console.error('Error al acceder al micrófono:', error);
+      isListeningActiveRef.current = false;
       alert('No se pudo acceder al micrófono. Por favor, concede los permisos necesarios.');
     }
   };
@@ -556,6 +630,10 @@ Formato de respuesta:
   const handleVoiceButton = async () => {
     if (voiceState === 'listening') {
       recognition?.stop();
+      // Limpiar transcript al detener manualmente
+      lastTranscriptRef.current = '';
+      setUserTranscript('');
+      isListeningActiveRef.current = false;
       setVoiceState('inactive');
       return;
     }
@@ -572,33 +650,29 @@ Formato de respuesta:
         audioUrlRef.current = null;
         isSpeakingRef.current = false;
       }
+      queueRef.current = [];
+      bufferRef.current = '';
+      // Limpiar transcript anterior
+      lastTranscriptRef.current = '';
       // comenzar a escuchar de inmediato
       try {
         await navigator.mediaDevices.getUserMedia({ audio: true });
         setUserTranscript('');
         setAstraResponse('');
+        isListeningActiveRef.current = true;
         setVoiceState('listening');
         playSound('listen');
         recognition?.start();
       } catch (error) {
         console.error('Error al acceder al micrófono:', error);
+        isListeningActiveRef.current = false;
         alert('No se pudo acceder al micrófono. Por favor, concede los permisos necesarios.');
       }
       return;
     }
 
-    try {
-      await navigator.mediaDevices.getUserMedia({ audio: true });
-
-      setUserTranscript('');
-      setAstraResponse('');
-      setVoiceState('listening');
-      playSound('listen');
-      recognition?.start();
-    } catch (error) {
-      console.error('Error al acceder al micrófono:', error);
-      alert('No se pudo acceder al micrófono. Por favor, concede los permisos necesarios.');
-    }
+    // Usar startListening para mantener consistencia
+    startListening();
   };
 
   const handleSendMessage = async () => {

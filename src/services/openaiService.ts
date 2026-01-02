@@ -5,47 +5,49 @@ import { SensorData } from '../hooks/useSensorData';
 
 /**
  * Normaliza textos para TTS en español.
- * - Elimina puntos suspensivos (...)
- * - Convierte decimales en métricas a palabras (ej: "25.5°C" -> "25 grados")
- * - Reemplaza comas/puntos en números con palabras "coma" (ej: "55.5%" -> "55 coma 5 porciento")
+ * Restructura métricas para que se lean correctamente con decimales.
+ * - Temperaturas: "22.5°C" -> "22 punto 5 grados"
+ * - Porcentajes: "55.5%" -> "55 punto 5 porciento"
+ * - Otras métricas: "410.5 ppm" -> "410 punto 5 ppm"
  */
 function normalizeForSpanishTTS(text: string): string {
   if (!text) return text;
 
+  let result = text;
+
   // 1. Eliminar puntos suspensivos (...)
-  let result = text.replace(/\.\.\./g, '');
+  result = result.replace(/\.\.\./g, '');
 
-  // 2. Reemplaza temperaturas: "25°C", "25.5°C", "25,5°C" -> "25 punto 5 grados" (con decimales)
-  result = result.replace(/(\d+(?:[.,]\d+)?)\s?°?\s?C\b/gi, (_m, n) => {
-    const raw = String(n);
-    const normalized = raw.replace(',', '.');
-    const parts = normalized.split('.');
-    if (parts.length === 2) {
-      // Tiene decimales: "22.5" -> "22 punto 5"
-      return `${parts[0]} punto ${parts[1]} grados`;
-    } else {
-      // Sin decimales: "22" -> "22 grados"
-      return `${parts[0]} grados`;
-    }
+  // 2. Temperaturas: "22.5°C", "22,5°C", "22°C" -> "22 punto 5 grados" o "22 grados"
+  result = result.replace(/(\d+)([.,])(\d+)\s?°?\s?C\b/gi, (_m, entero, sep, decimal) => {
+    return `${entero} punto ${decimal} grados`;
+  });
+  result = result.replace(/(\d+)\s?°?\s?C\b/gi, (_m, entero) => {
+    return `${entero} grados`;
   });
 
-  // 3. Reemplaza humedad: "55.5%" -> "55 coma 5 porciento"
-  result = result.replace(/(\d+)([.,])(\d+)\s?%/g, '$1 coma $3 porciento');
-  result = result.replace(/(\d+)\s?%/g, '$1 porciento');
-
-  // 4. Reemplaza CO2: "410.5 ppm" -> "410 coma 5 ppm"
-  result = result.replace(/(\d+)([.,])(\d+)\s?ppm/gi, '$1 coma $3 ppm');
-
-  // 5. Reemplaza luz en lux: "650.5 lux" -> "650 lux" (sin decimales para luz)
-  result = result.replace(/(\d+)([.,]\d+)?\s?lux/gi, (_m, n) => {
-    const raw = String(n);
-    const normalized = raw.replace(',', '.');
-    const rounded = Math.round(parseFloat(normalized));
-    return `${rounded} lux`;
+  // 3. Porcentajes: "55.5%" -> "55 punto 5 porciento", "55%" -> "55 porciento"
+  result = result.replace(/(\d+)([.,])(\d+)\s?%/g, (_m, entero, sep, decimal) => {
+    return `${entero} punto ${decimal} porciento`;
+  });
+  result = result.replace(/(\d+)\s?%/g, (_m, entero) => {
+    return `${entero} porciento`;
   });
 
-  // 6. Reemplaza otros decimales genéricos: "12.4 kWh" -> "12 coma 4 kWh"
-  result = result.replace(/(\d+)([.,])(\d+)\s?(kWh|kW|L\/h|ppm|lux)/gi, '$1 coma $3 $4');
+  // 4. CO2 (ppm): "410.5 ppm" -> "410 punto 5 ppm", "410 ppm" -> "410 ppm"
+  result = result.replace(/(\d+)([.,])(\d+)\s?ppm/gi, (_m, entero, sep, decimal) => {
+    return `${entero} punto ${decimal} ppm`;
+  });
+
+  // 5. Lux (iluminación): "650.5 lux" -> "650 punto 5 lux", "650 lux" -> "650 lux"
+  result = result.replace(/(\d+)([.,])(\d+)\s?lux/gi, (_m, entero, sep, decimal) => {
+    return `${entero} punto ${decimal} lux`;
+  });
+
+  // 6. Otras unidades: kWh, kW, etc. "12.4 kWh" -> "12 punto 4 kWh"
+  result = result.replace(/(\d+)([.,])(\d+)\s?(kWh|kW|L\/h)/gi, (_m, entero, sep, decimal, unidad) => {
+    return `${entero} punto ${decimal} ${unidad}`;
+  });
 
   return result;
 }
